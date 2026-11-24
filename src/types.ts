@@ -14,6 +14,8 @@ export interface User {
   role: Role;
   name?: string;
   patientId?: string | null;
+  /** set for role=doctor: id of the matching row in doctor-service (linked through doctors.user_id) */
+  doctorId?: string | null;
 }
 
 declare global {

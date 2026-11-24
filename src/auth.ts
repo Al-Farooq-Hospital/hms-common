@@ -6,7 +6,7 @@ const SECRET = process.env.JWT_SECRET || 'dev-only-secret-change-me';
 
 export function sign(u: User, expiresIn: string = '12h'): string {
   return jwt.sign(
-    { id: u.id, email: u.email, role: u.role, name: u.name, patientId: u.patientId ?? null },
+    { id: u.id, email: u.email, role: u.role, name: u.name, patientId: u.patientId ?? null, doctorId: u.doctorId ?? null },
     SECRET,
     { expiresIn } as jwt.SignOptions,
   );

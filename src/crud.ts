@@ -11,6 +11,9 @@ export interface HookCtx {
   req: Request;
 }
 
+/** extra row filter for the current user: rows where `field` is one of `values` (null = no restriction) */
+export type RowScope = { field: string; values: string[]; orNull?: boolean } | null;
+
 export interface Resource {
   /** URL path and (by default) table name */
   name: string;
@@ -28,6 +31,8 @@ export interface Resource {
   /** column holding the patient id; enables "patients see only their own rows" */
   patientField?: string;
   patientCanCreate?: boolean;
+  /** row-level restriction applied to staff reads, updates and deletes (e.g. a doctor only sees their own patients) */
+  scope?: (user: User, ctx: Ctx) => Promise<RowScope>;
   searchable?: string[];
   defaultSort?: string;
   hooks?: {
@@ -141,16 +146,20 @@ export function crudRouter(r: Resource, ctx: Ctx): Router {
   const router = Router();
 
   /** returns an extra WHERE restriction for the current user, or throws 403 */
-  function readScope(user: User): { field: string; value: string } | null {
-    if (allow(user, readRoles)) return null;
-    if (user.role === 'patient' && r.patientField && user.patientId) return { field: r.patientField, value: user.patientId };
+  async function readScope(user: User): Promise<RowScope> {
+    if (allow(user, readRoles)) return r.scope ? r.scope(user, ctx) : null;
+    if (user.role === 'patient' && r.patientField && user.patientId) return { field: r.patientField, values: [user.patientId] };
     throw new HttpError(403, 'Forbidden for role ' + user.role);
   }
+  const scopeSql = (scope: NonNullable<RowScope>, param: string) =>
+    scope.orNull ? `(${scope.field}::text = ANY(${param}::text[]) OR ${scope.field} IS NULL)` : `${scope.field}::text = ANY(${param}::text[])`;
+  const inScope = (scope: RowScope, row: any) =>
+    !scope || scope.values.includes(String(row[scope.field])) || (!!scope.orNull && (row[scope.field] === null || row[scope.field] === undefined));
 
   const hc = (req: Request): HookCtx => ({ ctx, user: req.user!, req });
 
   router.get('/', wrap(async (req, res) => {
-    const scope = readScope(req.user!);
+    const scope = await readScope(req.user!);
     const where: string[] = [];
     const params: unknown[] = [];
     const add = (sql: string, v: unknown) => {
@@ -172,7 +181,10 @@ export function crudRouter(r: Resource, ctx: Ctx): Router {
       params.push(`%${q}%`);
       where.push('(' + textCols.map((c) => `${c} ILIKE $${params.length}`).join(' OR ') + ')');
     }
-    if (scope) add(`${scope.field} = ?`, scope.value);
+    if (scope) {
+      params.push(scope.values);
+      where.push(scopeSql(scope, '$' + params.length));
+    }
     const w = where.length ? 'WHERE ' + where.join(' AND ') : '';
     const sortKey = typeof req.query.sort === 'string' && sortable.has(req.query.sort) ? req.query.sort : r.defaultSort ?? 'created_at';
     const dir = req.query.order === 'asc' ? 'ASC' : req.query.order === 'desc' ? 'DESC' : sortKey === 'created_at' && !req.query.sort ? 'DESC' : 'ASC';
@@ -184,12 +196,12 @@ export function crudRouter(r: Resource, ctx: Ctx): Router {
   }));
 
   router.get('/:id', wrap(async (req, res) => {
-    const scope = readScope(req.user!);
+    const scope = await readScope(req.user!);
     const params: unknown[] = [req.params.id];
     let w = 'id = $1';
     if (scope) {
-      params.push(scope.value);
-      w += ` AND ${scope.field} = $2`;
+      params.push(scope.values);
+      w += ` AND ${scopeSql(scope, '$2')}`;
     }
     const rows = await ctx.q(`SELECT * FROM ${t} WHERE ${w}`, params);
     if (!rows.length) throw new HttpError(404, `${r.name} not found`);
@@ -225,6 +237,7 @@ export function crudRouter(r: Resource, ctx: Ctx): Router {
     const data: any = updateSchema.parse(clean(req.body));
     const existing = (await ctx.q(`SELECT * FROM ${t} WHERE id = $1`, [req.params.id]))[0];
     if (!existing) throw new HttpError(404, `${r.name} not found`);
+    if (r.scope && !inScope(await r.scope(user, ctx), existing)) throw new HttpError(403, 'Not allowed for this record');
     await r.hooks?.beforeUpdate?.(data, existing, hc(req));
     const keys = names.filter((n) => data[n] !== undefined);
     if (!keys.length) return res.json(existing);
@@ -244,6 +257,10 @@ export function crudRouter(r: Resource, ctx: Ctx): Router {
   router.delete('/:id', wrap(async (req, res) => {
     const user = req.user!;
     if (!allow(user, removeRoles)) throw new HttpError(403, 'Forbidden for role ' + user.role);
+    if (r.scope) {
+      const cur = (await ctx.q(`SELECT * FROM ${t} WHERE id = $1`, [req.params.id]))[0];
+      if (cur && !inScope(await r.scope(user, ctx), cur)) throw new HttpError(403, 'Not allowed for this record');
+    }
     const rows = await ctx.q(`DELETE FROM ${t} WHERE id = $1 RETURNING *`, [req.params.id]);
     if (!rows.length) throw new HttpError(404, `${r.name} not found`);
     await r.hooks?.afterDelete?.(rows[0], hc(req));

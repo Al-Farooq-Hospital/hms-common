@@ -3,3 +3,4 @@ dist
 .next
 .env
 certs/*.pem
+package-lock.json
